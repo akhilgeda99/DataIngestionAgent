@@ -1,0 +1,11 @@
+id,name,age,salary,department
+1,John  DOE,,75000,Engineering
+2,Jane Smith,28,65000,MARKETING
+3,Bob Johnson,42,85000,engineering
+2,Jane  Smith,28,65000,Marketing
+5,,31,999999,Sales
+6,Charlie Wilson,39,,marketing
+7,ALICE BROWN,150,70000,SALES
+8,Dave Miller,35,NULL,Engineering
+9,Eve   Jones,29,45000,  Marketing  
+10,Frank White,-5,72000,engineering
