@@ -1,32 +1,55 @@
-"""FastAPI-based REST API for data ingestion and analysis.
-
-This module provides endpoints for file upload, analysis, and data quality assessment.
-Supports CSV, Excel, JSON file formats and SQL Server database tables with automated AI-powered analysis.
-"""
-
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Query
+"""FastAPI-based REST API for data ingestion and analysis."""
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
+import numpy as np
 import json
 import os
 import logging
+import io
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-from sqlalchemy.orm import Session
 
-from src.database import get_db, get_table_metadata, read_table_data, list_tables
+from src.database import db
+from src.ai_analysis import ai_analyzer
+from src.analysis.core.data_analyzer import DataAnalyzer
+from src.analysis.utils.type_converters import convert_polars_types, DateTimeEncoder
+from src.validation.data_validator import validate_data
+from src.validation.rule_storage import RuleStorage
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def convert_numpy_types(obj: Any) -> Any:
+    """Convert numpy types to Python native types for JSON serialization."""
+    if isinstance(obj, (np.integer, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, (np.ndarray, pd.Series)):
+        return [convert_numpy_types(x) for x in obj]
+    elif isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(x) for x in obj]
+    return obj
+
+# Initialize analyzers and rule storage
+data_analyzer = DataAnalyzer()
+rule_storage = RuleStorage()
 
 app = FastAPI(
     title="Data Ingestion API",
-    description="API for uploading and analyzing data files with AI-powered insights",
+    description="API for uploading and analyzing data files",
     version="1.0.0"
 )
 
-# Add CORS middleware to allow cross-origin requests
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,32 +58,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Constants for file storage
+# Constants
 UPLOAD_DIR = "uploads"
 
-# Mount static directories for serving files
+# Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 @app.get("/")
 async def read_root():
-    """Serve the main application interface.
-    
-    Returns:
-        FileResponse: The index.html file containing the web interface.
-    """
+    """Serve the main page."""
     return FileResponse("static/index.html")
+
+@app.get("/databases")
+async def list_databases():
+    """List available database configurations."""
+    try:
+        configs = db.configs
+        databases = [
+            {
+                "name": name,
+                "type": config["type"],
+                "host": config["host"],
+                "database": config["database"]
+            }
+            for name, config in configs.items()
+        ]
+        return {
+            "databases": databases,
+            "default": db._get_default_database()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/files")
 async def list_files() -> List[Dict[str, Any]]:
-    """List all uploaded files with their metadata.
-    
-    Returns:
-        List[Dict[str, Any]]: List of file information including name, path, size, and modification time.
-        
-    Raises:
-        HTTPException: If there's an error accessing the uploads directory.
-    """
+    """List uploaded files."""
     try:
         files = []
         for filename in os.listdir(UPLOAD_DIR):
@@ -78,136 +111,113 @@ async def list_files() -> List[Dict[str, Any]]:
 
 @app.get("/tables")
 async def list_database_tables(
-    schema: Optional[str] = Query(None, description="Optional schema name to filter tables"),
-    db: Session = Depends(get_db)
+    schema: Optional[str] = Query(None, description="Schema name filter"),
+    database: Optional[str] = Query(None, description="Database to use")
 ):
-    """List all available database tables.
-    
-    Args:
-        schema (str, optional): Schema name to filter tables
-        
-    Returns:
-        List[Dict[str, Any]]: List of tables with their schemas
-        
-    Raises:
-        HTTPException: If there's an error accessing the database.
-    """
+    """List available tables in database."""
     try:
-        return list_tables(schema=schema)
+        return db.list_tables(database=database, schema=schema)
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/tables/{schema}/{table_name}")
 async def get_table_info(
     schema: str,
     table_name: str,
-    db: Session = Depends(get_db)
+    database: Optional[str] = Query(None, description="Database to use")
 ):
-    """Get metadata for a specific database table.
-    
-    Args:
-        schema (str): Schema name
-        table_name (str): Name of the table to analyze
-        
-    Returns:
-        Dict: Table metadata including columns and their types.
-        
-    Raises:
-        HTTPException: If table not found or database error occurs.
-    """
+    """Get table metadata."""
     try:
-        return get_table_metadata(f"{schema}.{table_name}")
+        return db.get_table_info(f"{schema}.{table_name}", database=database)
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Table not found or error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/analyze/table/{schema}/{table_name}")
+@app.post("/analyze/table/{schema}/{table_name}")
 async def analyze_table(
     schema: str,
     table_name: str,
-    db: Session = Depends(get_db)
+    database: Optional[str] = Query(None, description="Database to use"),
+    use_ai: bool = Query(True, description="Use AI for advanced analysis"),
+    output_file: Optional[str] = Query(None, description="Optional JSON output file path"),
+    rules_file: Optional[UploadFile] = File(None, description="Optional JSON file containing validation rules")
 ):
-    """Analyze data from a database table.
-    
-    Performs comprehensive analysis including data quality assessment
-    and AI-powered insights on the table data.
-    
-    Args:
-        schema (str): Schema name
-        table_name (str): Name of the table to analyze
-        
-    Returns:
-        Dict: Analysis results including row count, columns, and AI-powered quality metrics.
-        
-    Raises:
-        HTTPException: If table not found or analysis fails.
-    """
+    """Analyze table data with optional AI-powered insights."""
     try:
-        # Read table data into DataFrame
-        df = read_table_data(table_name, schema=schema)
-            
-        # Get table metadata
-        metadata = get_table_metadata(f"{schema}.{table_name}")
+        # Read table data
+        df = db.read_table(table_name, schema=schema, database=database)
+        
+        # Get table info
+        info = db.get_table_info(f"{schema}.{table_name}", database=database)
+
+        logger.info(f"Table info: {df.dtypes}")
         
         if df.empty:
-            return {
+            result = {
                 "schema": schema,
                 "table_name": table_name,
-                "metadata": metadata,
+                "metadata": info,
                 "rows": 0,
-                "columns": [],
-                "analysis": {
-                    "status": "No data found in table",
-                    "quality_metrics": {
-                        "missing_values": {},
-                        "data_types": {},
-                        "unique_values": {},
-                        "completeness_ratio": {},
-                        "numeric_stats": {},
-                        "categorical_stats": {}
-                    },
-                    "row_count": 0,
-                    "column_count": 0
-                }
+                "columns": []
             }
-        
-        # Analyze data quality
-        analysis_results = analyze_data_quality(df)
-        
-        response = {
-            "schema": schema,
-            "table_name": table_name,
-            "metadata": metadata,
-            "rows": len(df),
-            "columns": df.columns.tolist(),
-            "analysis": {
-                "status": "Data analyzed successfully",
-                "quality_metrics": analysis_results,
-                "row_count": len(df),
-                "column_count": len(df.columns)
+        else:
+            # Get analysis results
+            quality_metrics = data_analyzer.analyze_data_quality(df)
+
+            # Get validation rules if provided
+            validation_rules = []
+            if rules_file:
+                rules_contents = await rules_file.read()
+                rules_json = json.loads(rules_contents)
+                validation_rules = rules_json.get('rules', [])
+
+            # Validate data using Great Expectations
+            validation_result = validate_data(df, validation_rules)
+            
+            # Prepare the complete result
+            result = {
+                "schema": schema,
+                "table_name": table_name,
+                "metadata": info,
+                "analysis_timestamp": datetime.now().isoformat(),
+                "quality_metrics": quality_metrics,
+                "validation_result": validation_result
             }
-        }
-        
-        return response
+
+        # Convert all data types to JSON-serializable format
+        try:
+            json_ready_result = convert_polars_types(result)
+        except Exception as e:
+            logger.error(f"Error converting data types: {e}")
+            raise HTTPException(status_code=500, detail=f"Error converting data types: {str(e)}")
+
+        # Write to JSON file if output path is provided
+        if output_file:
+            try:
+                # Create output directory if it doesn't exist
+                os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+                
+                # Write to JSON file with proper encoding and formatting
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(json_ready_result, f, indent=2, ensure_ascii=False, cls=DateTimeEncoder)
+                
+                logger.info(f"Analysis results written to {output_file}")
+            except Exception as e:
+                logger.error(f"Error writing to JSON file: {e}")
+                raise HTTPException(status_code=500, detail=f"Error writing to JSON file: {str(e)}")
+
+        return json_ready_result
+
     except Exception as e:
-        logger.error(f"Error analyzing table: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Analysis failed: {str(e)}"
-        )
+        logger.error(f"Error analyzing table: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/analyze/{filename}")
-async def analyze_existing_file(filename: str):
-    """Analyze an existing uploaded file.
-    
-    Args:
-        filename (str): Name of the file to analyze
-        
-    Returns:
-        Dict: Analysis results including row count, columns, and AI-powered quality metrics.
-        
-    Raises:
-        HTTPException: If file not found or format not supported.
-    """
+async def analyze_existing_file(filename: str, use_ai: bool = Query(True, description="Use AI for advanced analysis")):
+    """Get basic file information without analysis."""
     try:
         file_path = os.path.join(UPLOAD_DIR, filename)
         if not os.path.exists(file_path):
@@ -227,167 +237,218 @@ async def analyze_existing_file(filename: str):
                         data = json.load(f)
                     df = pd.json_normalize(data)
                 except:
-                    # Try JSON Lines
+                    # If that fails, try reading as JSON Lines
                     df = pd.read_json(file_path, lines=True)
             else:
-                raise HTTPException(status_code=400, detail="Unsupported file format")
+                raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
 
-        # Analyze data quality
-        analysis_results = analyze_data_quality(df)
-        
+        if df.empty:
+            return {
+                "filename": filename,
+                "rows": 0,
+                "columns": []
+            }
+
         return {
             "filename": filename,
             "rows": len(df),
-            "columns": df.columns.tolist(),
-            "ai_analysis": {
-                "quality_metrics": analysis_results
-            }
+            "columns": df.columns.tolist()
         }
-
-    except HTTPException as e:
-        raise e
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Analysis error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """Upload and analyze a new data file.
-    
-    Supports CSV, Excel (.xlsx, .xls), and JSON formats.
-    Performs immediate data quality analysis using AI techniques.
-    
-    Args:
-        file (UploadFile): The uploaded file object.
-        
-    Returns:
-        Dict: Upload results including filename, path, and AI analysis results.
-        
-    Raises:
-        HTTPException: If file format not supported or processing fails.
-    """
+@app.post("/analyze/quality/{filename}")
+async def analyze_file_quality(
+    filename: str,
+    use_ai: bool = Query(True, description="Use AI for advanced analysis"),
+    rules_file: Optional[UploadFile] = File(None, description="Optional JSON file containing validation rules")
+):
+    """Analyze data quality of an existing file."""
     try:
-        # Validate file extension
-        filename = file.filename.lower()
-        if not any(filename.endswith(ext) for ext in ['.csv', '.xlsx', '.xls', '.json']):
-            raise HTTPException(status_code=400, detail="Unsupported file format")
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
 
-        # Generate unique filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        name, ext = os.path.splitext(filename)
-        unique_filename = f"{name}_{timestamp}{ext}"
-        file_path = os.path.join(UPLOAD_DIR, unique_filename)
-
-        # Save the file
+        # Read the file based on its extension
+        ext = filename.lower().split('.')[-1]
         try:
-            content = await file.read()
-            with open(file_path, "wb") as f:
-                f.write(content)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error saving file: {str(e)}")
-
-        # Process the file
-        try:
-            if filename.endswith('.csv'):
+            if ext == 'csv':
                 df = pd.read_csv(file_path)
-            elif filename.endswith(('.xlsx', '.xls')):
+            elif ext in ['xlsx', 'xls']:
                 df = pd.read_excel(file_path)
-            elif filename.endswith('.json'):
+            elif ext == 'json':
                 # Try regular JSON first
                 try:
                     with open(file_path, 'r') as f:
                         data = json.load(f)
                     df = pd.json_normalize(data)
                 except:
-                    # Try JSON Lines
+                    # If that fails, try reading as JSON Lines
                     df = pd.read_json(file_path, lines=True)
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
         except Exception as e:
-            os.remove(file_path)  # Clean up on error
             raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
 
-        # Analyze data quality
-        analysis_results = analyze_data_quality(df)
-        
-        return {
-            "filename": unique_filename,
-            "original_filename": filename,
-            "path": f"/uploads/{unique_filename}",
-            "rows": len(df),
-            "columns": df.columns.tolist(),
-            "ai_analysis": {
-                "quality_metrics": analysis_results
+        if df.empty:
+            return {
+                "filename": filename,
+                "status": "No data found",
+                "quality_metrics": {},
+                "ai_insights": None
             }
-        }
 
-    except HTTPException as e:
-        raise e
+        # Use DataAnalyzer for comprehensive data quality analysis
+        quality_metrics = data_analyzer.analyze_data_quality(df)
+
+        # Add validation result if rules are provided
+        validation_result = None
+        saved_rules_info = None
+        if rules_file:
+            # Read rules file
+            rules_contents = await rules_file.read()
+            rules_json = json.loads(rules_contents)
+            validation_rules = rules_json.get('rules', [])
+            
+            # Save the rules
+            try:
+                name = os.path.splitext(rules_file.filename)[0]
+                filepath = rule_storage.save_rules_to_file(validation_rules, name)
+                saved_rules_info = {
+                    "filepath": filepath,
+                    "rule_count": len(validation_rules),
+                    "name": name
+                }
+            except Exception as e:
+                logger.warning(f"Failed to save rules: {e}")
+            
+            # Perform validation
+            validation_result = validate_data(df, validation_rules)
+        
+        # Add AI insights if requested
+        ai_insights = None
+        if use_ai:
+            try:
+                context = {
+                    "source": "file",
+                    "filename": filename,
+                    "file_type": ext
+                }
+                ai_analysis = ai_analyzer.analyze_dataframe(df, context=context)
+                ai_insights = convert_numpy_types(ai_analysis.get("ai_insights"))
+            except Exception as e:
+                logger.error(f"AI analysis error: {e}")
+                ai_insights = {"error": str(e)}
+
+        return {
+            "filename": filename,
+            "status": "Success",
+            "quality_metrics": quality_metrics,
+            "validation_result": validation_result,
+            "saved_rules_info": saved_rules_info,
+            "ai_insights": ai_insights
+        }
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Analysis error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-def analyze_data_quality(df: pd.DataFrame) -> Dict[str, Any]:
-    """Analyze data quality metrics for a DataFrame.
-    
-    Computes various quality metrics including:
-    - Missing values per column
-    - Data types
-    - Unique value counts
-    - Completeness ratio for each column
-    - Basic statistics for numeric columns
-    
-    Args:
-        df (pd.DataFrame): Input DataFrame to analyze.
-        
-    Returns:
-        Dict[str, Any]: Dictionary containing quality metrics.
-    """
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    use_ai: bool = Query(True, description="Use AI for advanced analysis")
+):
+    """Upload and analyze a new data file with optional AI insights."""
     try:
-        # Basic metrics for all columns
-        metrics = {
-            "missing_values": df.isnull().sum().to_dict(),
-            "data_types": {col: str(dtype) for col, dtype in df.dtypes.items()},
-            "unique_values": df.nunique().to_dict(),
-            "completeness_ratio": {
-                col: float((len(df) - df[col].isnull().sum()) / len(df))
-                for col in df.columns
-            }
-        }
+        # Ensure upload directory exists
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
         
-        # Add numeric column statistics
-        numeric_stats = {}
-        numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
-        for col in numeric_cols:
-            numeric_stats[col] = {
-                "mean": float(df[col].mean()) if not df[col].isnull().all() else 0,
-                "std": float(df[col].std()) if not df[col].isnull().all() else 0,
-                "min": float(df[col].min()) if not df[col].isnull().all() else 0,
-                "max": float(df[col].max()) if not df[col].isnull().all() else 0
-            }
-        metrics["numeric_stats"] = numeric_stats
+        # Validate file extension
+        allowed_extensions = ['csv', 'xlsx', 'xls', 'json']
+        file_extension = file.filename.split('.')[-1].lower()
+        if file_extension not in allowed_extensions:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_extension}")
         
-        # Add categorical column statistics
-        categorical_stats = {}
-        categorical_cols = df.select_dtypes(include=['object', 'category']).columns
-        for col in categorical_cols:
-            value_counts = df[col].value_counts()
-            if not value_counts.empty:
-                top_5_values = value_counts.head(5)
-                categorical_stats[col] = {
-                    "top_values": top_5_values.index.tolist(),
-                    "frequencies": top_5_values.values.tolist()
-                }
-        metrics["categorical_stats"] = categorical_stats
+        # Create a unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_filename = f"{timestamp}_{file.filename}"
+        file_path = os.path.join(UPLOAD_DIR, unique_filename)
+
+        # Save the uploaded file
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
         
-        return metrics
-    except Exception as e:
-        logger.error(f"Error analyzing data quality: {str(e)}")
+        # Return basic file info without analysis
         return {
-            "error": f"Failed to analyze data quality: {str(e)}",
-            "missing_values": {},
-            "data_types": {},
-            "unique_values": {},
-            "completeness_ratio": {}
+            "filename": unique_filename,
+            "original_filename": file.filename,
+            "size": len(content),
+            "path": f"/uploads/{unique_filename}",
+            "upload_time": datetime.now().isoformat()
         }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/validate")
+async def validate(file: UploadFile = File(...), rules_file: UploadFile = File(...)):
+    """Validate data against business rules."""
+    try:
+        # Step 1: Read business rules from the uploaded file (assumed to be JSON)
+        rules_contents = await rules_file.read()
+        rules_json = json.loads(rules_contents)
+        rules = rules_json.get('rules', [])
+
+        # Step 2: Read the CSV file into a DataFrame
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+
+        # Step 3: Validate the DataFrame based on the rules
+        validation_result = validate_data(df, rules)
+        return validation_result
+
+    except Exception as e:
+        logger.error(f"Error during validation: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.post("/rules/save")
+async def save_rules(rules_file: UploadFile = File(...), name: Optional[str] = None):
+    """Save business rules from a JSON file to the rules storage."""
+    try:
+        # Read the rules file
+        contents = await rules_file.read()
+        rules_json = json.loads(contents)
+        rules = rules_json.get('rules', [])
+        
+        # Use the original filename if no name provided
+        if not name:
+            name = os.path.splitext(rules_file.filename)[0]
+            
+        # Save rules to file
+        filepath = rule_storage.save_rules_to_file(rules, name)
+        
+        return {
+            "status": "success",
+            "message": "Rules saved successfully",
+            "filepath": filepath,
+            "rule_count": len(rules)
+        }
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON format in rules file")
+    except Exception as e:
+        logger.error(f"Error saving rules: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

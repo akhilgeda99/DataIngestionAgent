@@ -1,0 +1,61 @@
+[
+  {
+    "expectation_type": "expect_column_values_to_not_be_null",
+    "kwargs": {
+      "column": "product_id"
+    },
+    "meta": {
+      "description": "Product ID should never be null"
+    }
+  },
+  {
+    "expectation_type": "expect_column_values_to_not_be_null",
+    "kwargs": {
+      "column": "product_name"
+    }
+  },
+  {
+    "expectation_type": "expect_column_values_to_be_between",
+    "kwargs": {
+      "column": "quantity",
+      "min_value": 0,
+      "max_value": 1000
+    },
+    "meta": {
+      "description": "Quantity should be between 0 and 1000"
+    }
+  },
+  {
+    "expectation_type": "expect_column_values_to_be_between",
+    "kwargs": {
+      "column": "price",
+      "min_value": 0,
+      "max_value": 10000
+    }
+  },
+  {
+    "expectation_type": "expect_column_pair_values_to_be_equal",
+    "kwargs": {
+      "column_A": "total",
+      "column_B": "price * quantity"
+    },
+    "rule_id": "total_validation",
+    "meta": {
+      "description": "Total should equal price times quantity"
+    }
+  },
+  {
+    "expectation_type": "expect_column_values_to_match_regex",
+    "kwargs": {
+      "column": "sale_date",
+      "regex": "^\\d{4}-\\d{2}-\\d{2}$"
+    }
+  },
+  {
+    "expectation_type": "expect_column_values_to_be_in_set",
+    "kwargs": {
+      "column": "category",
+      "value_set": ["Electronics", "Accessories"]
+    }
+  }
+]

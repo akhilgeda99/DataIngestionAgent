@@ -1,3 +1,3 @@
-from .data_analyzer import DataAnalyzer
+from .core.data_analyzer import DataAnalyzer
 
 __all__ = ['DataAnalyzer']

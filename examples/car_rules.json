@@ -1,0 +1,24 @@
+{
+    "rules": [
+        {
+            "expectation_type": "expect_column_values_to_not_be_null",
+            "kwargs": {
+                "column": "Make"
+            }
+        },
+        {
+            "expectation_type": "expect_column_values_to_be_in_set",
+            "kwargs": {
+                "column": "Colour",
+                "value_set": ["Red", "Blue", "Green", "Black", "White", "Silver"]
+            }
+        },
+        {
+            "expectation_type": "expect_column_values_to_match_regex",
+            "kwargs": {
+                "column": "Price",
+                "regex": "^\\$?[0-9]+(,[0-9]{3})*(\\.\\d{1,2})?$"
+            }
+        }
+    ]
+}

@@ -139,20 +139,24 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             fileAnalysis.innerHTML = '<div class="text-center"><div class="spinner-border" role="status"></div></div>';
             
-            const response = await fetch(`/analyze/${filename}`);
+            const response = await fetch(`/analyze/quality/${filename}`);
             const data = await response.json();
+            console.log('API Response:', data);
 
             // Transform the data to match the expected structure
             const analysis = {
                 analysis: {
-                    row_count: data.rows,
-                    column_count: data.columns.length,
-                    quality_metrics: data.ai_analysis.quality_metrics
+                    row_count: data.quality_metrics?.total_rows || 0,
+                    column_count: data.quality_metrics?.total_columns || 0,
+                    quality_metrics: data.quality_metrics || {},
+                    ai_insights: data.ai_insights
                 }
             };
+            console.log('Transformed Analysis:', analysis);
 
             displayAnalysis(analysis, fileAnalysis, filename);
         } catch (error) {
+            console.error('Analysis Error:', error);
             showAlert('danger', `Analysis failed: ${error.message}`);
             fileAnalysis.innerHTML = `
                 <div class="alert alert-danger">
@@ -213,8 +217,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Utility functions
     function displayAnalysis(analysis, container, itemName = '') {
+        console.log('Display Analysis Input:', { analysis, itemName });
+        
         // Handle case when analysis is empty or doesn't have expected structure
-        if (!analysis || !analysis.analysis) {
+        if (!analysis || !analysis.analysis || !analysis.analysis.quality_metrics) {
+            console.warn('Invalid analysis structure:', analysis);
             container.innerHTML = `
                 <div class="alert alert-info">
                     <i class="fas fa-info-circle me-2"></i>
@@ -225,6 +232,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         const metrics = analysis.analysis;
+        const quality = metrics.quality_metrics;
+        console.log('Quality Metrics:', quality);
         
         container.innerHTML = `
             <div class="analysis-header mb-4 text-center">
@@ -233,26 +242,40 @@ document.addEventListener('DOMContentLoaded', () => {
                     ${itemName}
                 </h4>
                 <div class="badge bg-primary">
-                    <i class="fas fa-table me-1"></i> ${metrics.row_count} rows
+                    <i class="fas fa-table me-1"></i> ${quality.total_rows} rows
                 </div>
                 <div class="badge bg-secondary">
-                    <i class="fas fa-columns me-1"></i> ${metrics.column_count} columns
+                    <i class="fas fa-columns me-1"></i> ${quality.total_columns} columns
                 </div>
             </div>
 
             <div class="row">
                 <div class="col-12">
-                    ${metrics.quality_metrics ? renderQualityMetrics(metrics.quality_metrics) : ''}
+                    ${renderQualityMetrics(quality)}
                 </div>
             </div>
 
-            ${metrics.quality_metrics ? `
+            <div class="row mt-4">
+                <div class="col-md-6">
+                    ${renderNumericStats(quality)}
+                </div>
+                <div class="col-md-6">
+                    ${renderCategoricalStats(quality)}
+                </div>
+            </div>
+
+            ${metrics.ai_insights ? `
                 <div class="row mt-4">
-                    <div class="col-md-6">
-                        ${renderNumericStats(metrics.quality_metrics)}
-                    </div>
-                    <div class="col-md-6">
-                        ${renderCategoricalStats(metrics.quality_metrics)}
+                    <div class="col-12">
+                        <div class="card">
+                            <div class="card-header">
+                                <i class="fas fa-robot me-2"></i>
+                                AI Insights
+                            </div>
+                            <div class="card-body">
+                                <pre class="mb-0">${JSON.stringify(metrics.ai_insights, null, 2)}</pre>
+                            </div>
+                        </div>
                     </div>
                 </div>
             ` : ''}
@@ -265,8 +288,27 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderQualityMetrics(metrics) {
-        if (!metrics || !metrics.data_types) {
-            return '';
+        console.log('Render Quality Metrics Input:', metrics);
+        
+        if (!metrics || !metrics.column_stats) {
+            console.warn('Invalid metrics structure:', metrics);
+            return `
+                <div class="alert alert-warning">
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    No column statistics available.
+                </div>
+            `;
+        }
+
+        // Check if we have any columns to display
+        const columns = Object.keys(metrics.column_stats);
+        if (columns.length === 0) {
+            return `
+                <div class="alert alert-info">
+                    <i class="fas fa-info-circle me-2"></i>
+                    No columns to analyze.
+                </div>
+            `;
         }
 
         return `
@@ -290,25 +332,32 @@ document.addEventListener('DOMContentLoaded', () => {
                                 </tr>
                             </thead>
                             <tbody>
-                                ${Object.keys(metrics.data_types).map(column => {
-                                    const completeness = metrics.completeness_ratio?.[column] || 0;
+                                ${Object.entries(metrics.column_stats).map(([column, stats]) => {
+                                    console.log('Processing column:', column, 'stats:', stats);
+                                    const total = metrics.total_rows || 0;
+                                    const missing = stats.null_count || 0;
+                                    const completeness = total > 0 ? (total - missing) / total : 0;
                                     const completenessClass = completeness > 0.9 ? 'success' : 
-                                                            completeness > 0.7 ? 'warning' : 'danger';
+                                                         completeness > 0.7 ? 'warning' : 'danger';
                                     return `
                                         <tr>
                                             <td><strong>${column}</strong></td>
-                                            <td><span class="badge bg-secondary">${metrics.data_types[column] || 'N/A'}</span></td>
-                                            <td>${metrics.missing_values?.[column] || 0}</td>
-                                            <td>${metrics.unique_values?.[column] || 'N/A'}</td>
+                                            <td><span class="badge bg-secondary">${stats.dtype || 'N/A'}</span></td>
+                                            <td>${missing}</td>
+                                            <td>${stats.unique_count || 'N/A'}</td>
                                             <td>
                                                 <div class="d-flex align-items-center">
                                                     <div class="progress flex-grow-1" style="height: 6px;">
                                                         <div class="progress-bar bg-${completenessClass}" 
                                                              role="progressbar" 
-                                                             style="width: ${(completeness * 100).toFixed(1)}%">
-                                                        </div>
+                                                             style="width: ${(completeness * 100).toFixed(1)}%"
+                                                             aria-valuenow="${(completeness * 100).toFixed(1)}"
+                                                             aria-valuemin="0"
+                                                             aria-valuemax="100"></div>
                                                     </div>
-                                                    <span class="ms-2 small">${(completeness * 100).toFixed(1)}%</span>
+                                                    <small class="text-muted ms-2">
+                                                        ${(completeness * 100).toFixed(1)}%
+                                                    </small>
                                                 </div>
                                             </td>
                                         </tr>
@@ -323,8 +372,24 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderNumericStats(metrics) {
-        if (!metrics.numeric_stats || Object.keys(metrics.numeric_stats).length === 0) {
-            return '';
+        console.log('Render Numeric Stats Input:', metrics);
+        
+        // Find numeric columns from column_stats
+        const numericColumns = Object.entries(metrics.column_stats || {})
+            .filter(([_, stats]) => {
+                const dtype = (stats.dtype || '').toLowerCase();
+                return dtype.includes('float') || dtype.includes('int');
+            });
+
+        console.log('Numeric Columns:', numericColumns);
+
+        if (numericColumns.length === 0) {
+            return `
+                <div class="alert alert-info">
+                    <i class="fas fa-info-circle me-2"></i>
+                    No numeric columns found.
+                </div>
+            `;
         }
 
         return `
@@ -344,21 +409,44 @@ document.addEventListener('DOMContentLoaded', () => {
                                     <th>Mean</th>
                                     <th>Std</th>
                                     <th>Range</th>
+                                    <th>Quartiles</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                ${Object.entries(metrics.numeric_stats).map(([column, stats]) => `
-                                    <tr>
-                                        <td><strong>${column}</strong></td>
-                                        <td>${stats?.mean?.toFixed(2) || 'N/A'}</td>
-                                        <td>${stats?.std?.toFixed(2) || 'N/A'}</td>
-                                        <td>
-                                            <span class="text-muted">${stats?.min ?? 'N/A'}</span>
-                                            <i class="fas fa-arrow-right mx-1 small"></i>
-                                            <span class="text-muted">${stats?.max ?? 'N/A'}</span>
-                                        </td>
-                                    </tr>
-                                `).join('')}
+                                ${numericColumns.map(([column, stats]) => {
+                                    console.log('Processing numeric column:', column, 'stats:', stats);
+                                    const formatNumber = (num) => {
+                                        if (num === undefined || num === null) return 'N/A';
+                                        const n = parseFloat(num);
+                                        return isNaN(n) ? 'N/A' : n.toFixed(2);
+                                    };
+
+                                    const mean = formatNumber(stats.mean);
+                                    const std = formatNumber(stats.std);
+                                    const range = stats.min !== undefined && stats.max !== undefined
+                                        ? `${formatNumber(stats.min)} - ${formatNumber(stats.max)}`
+                                        : 'N/A';
+                                    
+                                    let quartiles = 'N/A';
+                                    if (stats.quartiles) {
+                                        const q1 = formatNumber(stats.quartiles['25']);
+                                        const q2 = formatNumber(stats.quartiles['50']);
+                                        const q3 = formatNumber(stats.quartiles['75']);
+                                        if (q1 !== 'N/A' && q2 !== 'N/A' && q3 !== 'N/A') {
+                                            quartiles = `25%: ${q1}<br>50%: ${q2}<br>75%: ${q3}`;
+                                        }
+                                    }
+
+                                    return `
+                                        <tr>
+                                            <td><strong>${column}</strong></td>
+                                            <td>${mean}</td>
+                                            <td>${std}</td>
+                                            <td>${range}</td>
+                                            <td>${quartiles}</td>
+                                        </tr>
+                                    `;
+                                }).join('')}
                             </tbody>
                         </table>
                     </div>
@@ -368,8 +456,24 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderCategoricalStats(metrics) {
-        if (!metrics.categorical_stats || Object.keys(metrics.categorical_stats).length === 0) {
-            return '';
+        console.log('Render Categorical Stats Input:', metrics);
+        
+        // Find categorical columns from column_stats
+        const categoricalColumns = Object.entries(metrics.column_stats || {})
+            .filter(([_, stats]) => {
+                const dtype = (stats.dtype || '').toLowerCase();
+                return dtype === 'str' || dtype === 'category' || dtype.includes('object');
+            });
+
+        console.log('Categorical Columns:', categoricalColumns);
+
+        if (categoricalColumns.length === 0) {
+            return `
+                <div class="alert alert-info">
+                    <i class="fas fa-info-circle me-2"></i>
+                    No categorical columns found.
+                </div>
+            `;
         }
 
         return `
@@ -386,31 +490,35 @@ document.addEventListener('DOMContentLoaded', () => {
                             <thead class="table-light">
                                 <tr>
                                     <th>Column</th>
-                                    <th>Top Values</th>
+                                    <th>Unique Values</th>
+                                    <th>Sample Values</th>
+                                    <th>Missing</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                ${Object.entries(metrics.categorical_stats).map(([column, stats]) => `
-                                    <tr>
-                                        <td><strong>${column}</strong></td>
-                                        <td>
-                                            ${stats?.top_values?.map((value, index) => `
-                                                <div class="mb-1">
-                                                    <div class="d-flex justify-content-between align-items-center">
-                                                        <span class="text-truncate me-2">${value}</span>
-                                                        <span class="badge bg-info">${stats.frequencies[index]}</span>
-                                                    </div>
-                                                    <div class="progress" style="height: 4px;">
-                                                        <div class="progress-bar bg-info" 
-                                                             role="progressbar" 
-                                                             style="width: ${(stats.frequencies[index] / Math.max(...stats.frequencies) * 100)}%">
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            `).join('') || 'N/A'}
-                                        </td>
-                                    </tr>
-                                `).join('')}
+                                ${categoricalColumns.map(([column, stats]) => {
+                                    console.log('Processing categorical column:', column, 'stats:', stats);
+                                    const uniqueCount = stats.unique_count || 'N/A';
+                                    const missing = stats.null_count || 0;
+                                    const sampleValues = Array.isArray(stats.sample_values) && stats.sample_values.length > 0
+                                        ? stats.sample_values.slice(0, 3).map(v => 
+                                            v === null || v === undefined ? '(empty)' : String(v).slice(0, 30)
+                                          ).join(', ')
+                                        : 'N/A';
+                                    
+                                    return `
+                                        <tr>
+                                            <td><strong>${column}</strong></td>
+                                            <td>${uniqueCount}</td>
+                                            <td>
+                                                <span class="text-muted small">
+                                                    ${sampleValues}
+                                                </span>
+                                            </td>
+                                            <td>${missing}</td>
+                                        </tr>
+                                    `;
+                                }).join('')}
                             </tbody>
                         </table>
                     </div>
